@@ -28,10 +28,16 @@ export class MissionLedger {
   private readonly sink: LedgerSink;
   private readonly clock: () => number;
 
-  /** @param sink durable sink (omit for a pure in-memory ledger). @param clock injectable for tests. */
-  constructor(sink?: LedgerSink, clock: () => number = Date.now) {
+  /**
+   * @param sink durable sink (omit for a pure in-memory ledger).
+   * @param clock injectable for tests.
+   * @param startSeq first seq to mint. After a resume, seed this to (last on-disk seq + 1) so
+   *   appended events never collide with recovered ones and the whole file stays monotonic.
+   */
+  constructor(sink?: LedgerSink, clock: () => number = Date.now, startSeq = 0) {
     this.sink = sink ?? this.mem;
     this.clock = clock;
+    this.seq = startSeq;
   }
 
   record(input: RecordInput): LedgerEvent {

@@ -42,11 +42,12 @@
 - [x] Status reporting and health checks
 - [~] Hooks system for lifecycle events
 - [ ] Distributed command across multiple nodes
-- [~] State persistence and recovery after crash
+- [x] State persistence and recovery after crash
   - [x] Graceful-shutdown snapshot + restore (`state.json`, `loadPersistedState`) — see `src/server.ts`
   - [x] Foldable Mission Ledger + deterministic **replay-equivalence** (`src/ledger`, `verify-claims` CLAIM 8): an auditor re-derives a *recorded* run to a committed state hash. Proven end-to-end against the real server by `npm run test:ledger-e2e` (fold(`ledger.jsonl`) === persisted `state.json`).
-  - [ ] Resume-from-ledger after an *abrupt* crash (fold `ledger.jsonl` on boot) — follow-up
-  - Honest scope: replay re-derives what was RECORDED; it does not claim re-running the live agents reproduces the run (agent/tool output is nondeterministic, captured once as data).
+  - [x] **Resume-from-ledger after an *abrupt* crash**: on boot the fsync'd `ledger.jsonl` is folded over the (possibly stale) snapshot, recovering mutations a SIGKILL dropped from the debounced `state.json`. Proven by `npm run test:ledger-resume-e2e` (SIGKILL with no snapshot written → full recovery from the ledger).
+  - v1 covers the CRUD contract events; multi-entity side effects with no id in their payload and deletes are follow-up hardening.
+  - Honest scope: replay/resume re-derive what was RECORDED; they do not claim re-running the live agents reproduces the run (agent/tool output is nondeterministic, captured once as data).
 
 ### Factory Functions
 - [x] `createTempest()` - Standard operation

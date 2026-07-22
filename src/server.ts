@@ -19,7 +19,7 @@ import { promisify } from 'util';
 import { createHash, randomUUID } from 'crypto';
 import { config } from './config/index.js';
 import { redactString, redactLedgerText, redactSecrets } from './redact.js';
-import { MissionLedger, JsonlFileSink } from './ledger/index.js';
+import { MissionLedger, JsonlFileSink, foldLedger, readLedgerFile } from './ledger/index.js';
 import { LLMBackbone } from './llm/index.js';
 import { TempestCommand } from './index.js';
 import { OpGeneral } from './general/index.js';
@@ -4636,6 +4636,22 @@ export const LEDGER_COVERED = [
   'watchCycleLedger',
 ] as const;
 
+// Writable registry of the covered ledgers — used by resume to fold the log back into live state.
+// Cast through unknown: Map is invariant in its value type, but every entity carries `id: string`.
+const LEDGER_MAPS: Record<string, Map<string, { id: string }>> = {
+  approvalRequests: approvalRequests as unknown as Map<string, { id: string }>,
+  evidenceLedger: evidenceLedger as unknown as Map<string, { id: string }>,
+  findingsLedger: findingsLedger as unknown as Map<string, { id: string }>,
+  retestLedger: retestLedger as unknown as Map<string, { id: string }>,
+  hypothesisLedger: hypothesisLedger as unknown as Map<string, { id: string }>,
+  workOrderLedger: workOrderLedger as unknown as Map<string, { id: string }>,
+  missionDrafts: missionDrafts as unknown as Map<string, { id: string }>,
+  improvementProposals: improvementProposals as unknown as Map<string, { id: string }>,
+  memoryProposals: memoryProposals as unknown as Map<string, { id: string }>,
+  memoryCapsule: memoryCapsule as unknown as Map<string, { id: string }>,
+  watchCycleLedger: watchCycleLedger as unknown as Map<string, { id: string }>,
+};
+
 let missionLedger: MissionLedger | null = null;
 function ledgerFilePath(): string | null {
   const root = stateRoot();
@@ -4646,11 +4662,45 @@ function getMissionLedger(): MissionLedger {
   const file = ledgerFilePath();
   if (file) {
     mkdirSync(stateRoot(), { recursive: true });
-    missionLedger = new MissionLedger(new JsonlFileSink(file));
+    // Continue seq past any recovered log so appended events stay monotonic across a resume.
+    const existing = readLedgerFile(file);
+    const startSeq = existing.length ? Math.max(...existing.map(e => e.seq)) + 1 : 0;
+    missionLedger = new MissionLedger(new JsonlFileSink(file), Date.now, startSeq);
   } else {
     missionLedger = new MissionLedger();
   }
   return missionLedger;
+}
+
+/**
+ * Resume-from-ledger — abrupt-crash recovery. state.json is debounced (≤1s) and only flushed on a
+ * GRACEFUL shutdown, so a SIGKILL / power-loss can lose the last window. ledger.jsonl is fsync'd per
+ * event, so it outlives that gap. On boot (AFTER loadPersistedState), fold the ledger and merge it
+ * over the restored snapshot: the ledger is authoritative for its covered ledgers because it is
+ * strictly more current. Entities only in the snapshot (or non-covered state) are left untouched.
+ */
+function resumeFromLedger(): void {
+  const file = ledgerFilePath();
+  if (!file) return;
+  let events;
+  try {
+    events = readLedgerFile(file);
+  } catch (error) {
+    console.warn(`[T3MP3ST] Ledger resume skipped (unreadable log): ${(error as Error).message || error}`);
+    return;
+  }
+  if (!events.length) return;
+  const folded = foldLedger(events);
+  let recovered = 0;
+  for (const [name, entities] of Object.entries(folded)) {
+    const map = LEDGER_MAPS[name];
+    if (!map) continue;
+    for (const [id, entity] of Object.entries(entities)) {
+      map.set(id, entity as { id: string });
+      recovered++;
+    }
+  }
+  console.log(`[T3MP3ST] Ledger resume: folded ${events.length} event(s) → ${recovered} entit(ies) across ${Object.keys(folded).length} ledger(s)`);
 }
 
 /** Record a complete, redacted upsert for each entity referenced by a contract event. */
@@ -7511,6 +7561,7 @@ async function startServer() {
   console.log('');
 
   await loadPersistedState();
+  resumeFromLedger(); // reconcile any post-snapshot mutations from the fsync'd ledger (abrupt-crash recovery)
   llm = await initLLM();
 
   // Graceful-shutdown flush: on SIGTERM/SIGINT (Ctrl-C, docker stop, systemctl restart) write
