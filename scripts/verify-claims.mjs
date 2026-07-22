@@ -15,6 +15,7 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { suiteFromDirs, suiteReport, fmtReport } from './passk.mjs';
 import { loadSamples, scoreSample, scoreFinding } from './cve-zero-hunt.mjs';
@@ -226,6 +227,45 @@ console.log('\nCLAIM 7 — CVE-Zero-v2 (held-out): hunt generalizes to fresh uns
     check('CVE-Zero held-out — full pack surfaces ALL 10 (anyHit, re-derived)', swarmAny >= 10, `full-pack anyHit ${swarmAny}/${n}`);
     check('CVE-Zero held-out — single agent pins ≥ 8/10 to EXACT file+line+CWE (re-derived)', soloExact >= 8, `solo exact-CWE ${soloExact}/${n}`);
     check('CVE-Zero held-out — single-agent strict ≥ 8/10 (stable)', soloStrict >= 8, `solo strict ${soloStrict}/${n}`);
+  }
+}
+
+// ── CLAIM 8: Mission Ledger — the engine's own state re-derives from a committed event log ──
+// Same stance as every claim above: fold committed artifacts, no LLM, no live re-run. This proves
+// replay-EQUIVALENCE (a recorded run re-derives to its state hash), NOT that re-running the live
+// agents reproduces the run (agent/tool output is nondeterministic, captured once as data).
+console.log('\nCLAIM 8 — Mission Ledger: committed event log folds to the recorded state hash (replay-equivalence)');
+{
+  const ledgerPath = R('bench/replay/golden.ledger.jsonl');
+  const hashPath = R('bench/replay/golden.state.sha256');
+  if (!fs.existsSync(ledgerPath) || !fs.existsSync(hashPath)) {
+    check('Mission Ledger golden present', false, 'bench/replay/golden.{ledger.jsonl,state.sha256} missing');
+  } else {
+    // Independent re-derivation (plain node) of src/ledger's fold + canonical hash. If this inline
+    // impl and the TS reducer ever diverge, one of the two gates (this, or ledger-replay.test.ts) fails.
+    const sortVal = (v) => Array.isArray(v) ? v.map(sortVal)
+      : (v && typeof v === 'object')
+        ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, sortVal(v[k])]))
+        : v;
+    const hashOf = (s) => createHash('sha256').update(JSON.stringify(sortVal(s))).digest('hex');
+    const events = fs.readFileSync(ledgerPath, 'utf8').split('\n')
+      .map((l) => l.trim()).filter(Boolean)
+      .map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean)
+      .sort((a, b) => a.seq - b.seq);
+    const state = {};
+    for (const ev of events) {
+      const bucket = (state[ev.ledger] ??= {});
+      if (ev.op === 'delete') delete bucket[ev.id]; else bucket[ev.id] = ev.entity ?? {};
+      if (Object.keys(bucket).length === 0) delete state[ev.ledger];
+    }
+    const folded = hashOf(state);
+    const committed = fs.readFileSync(hashPath, 'utf8').trim();
+    check('Mission Ledger — golden folds to committed state hash (independent re-derivation)',
+      folded === committed, `${events.length} events → ${folded.slice(0, 12)}… ${folded === committed ? '==' : '!='} committed`);
+    check('Mission Ledger — event seqs are monotonic 0..n-1 (causal fold order)',
+      events.every((e, i) => e.seq === i), `${events.length} events`);
+    check('Mission Ledger — fold spans multiple engine ledgers (not a single-table toy)',
+      Object.keys(state).length >= 5, `${Object.keys(state).length} ledgers: ${Object.keys(state).sort().join(', ')}`);
   }
 }
 

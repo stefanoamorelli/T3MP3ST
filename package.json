@@ -70,6 +70,8 @@
     "test:lessons": "node scripts/lessons.mjs --self-test",
     "test:no-self-fitting": "node scripts/test-no-self-fitting.mjs",
     "test:no-phantom-tools": "vitest run src/__tests__/no-phantom-tools.test.ts",
+    "test:ledger-e2e": "tsx scripts/ledger-e2e.mjs",
+    "ledger:golden": "tsx scripts/ledger-e2e.mjs --emit-golden",
     "test:spine-live": "vitest run src/__tests__/spine-live.test.ts",
     "smoke": "node scripts/smoke.mjs",
     "smoke:live": "node scripts/smoke.mjs --live",
