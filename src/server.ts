@@ -13,11 +13,13 @@ import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import { execFile, spawn } from 'child_process';
 import { appendFile, mkdir, readFile, writeFile } from 'fs/promises';
+import { mkdirSync } from 'node:fs';
 import { join } from 'path';
 import { promisify } from 'util';
 import { createHash, randomUUID } from 'crypto';
 import { config } from './config/index.js';
 import { redactString, redactLedgerText, redactSecrets } from './redact.js';
+import { MissionLedger, JsonlFileSink, foldLedger, readLedgerFile } from './ledger/index.js';
 import { LLMBackbone } from './llm/index.js';
 import { TempestCommand } from './index.js';
 import { OpGeneral } from './general/index.js';
@@ -4564,6 +4566,163 @@ function buildArsenalActivationPlan(): Record<string, unknown> {
   };
 }
 
+// =============================================================================
+// MISSION LEDGER — a COMPLETE, foldable event stream (src/ledger).
+//
+// The server's events.jsonl (appendStateEvent) is a write-only NOTIFICATION log: its payloads
+// carry only ids + scalars ({findingId, severity, ...}), so it can never reconstruct state.
+// The mission ledger fixes that at the single contract-event choke point: every mutation event
+// carries the entity id, so we read the full POST-mutation entity back from its Map, redact it,
+// and record a complete upsert. Folding the ledger then re-derives the recorded state — the
+// engine's own `verify-claims` (see scripts/verify-claims.mjs + bench/replay).
+//
+// v1 scope (honest): the CRUD flows below are covered and proven fold==snapshot on committed
+// goldens + a live E2E. Multi-entity side effects with no id in their payload (orders spawned
+// by hypothesis.decomposed; evidence attached during work_order.completed) are NOT yet captured
+// and are best-effort only — full coverage + deletes are follow-up hardening.
+// =============================================================================
+
+interface LedgerCapture { idField: string; ledgerName: string; map: ReadonlyMap<string, { id: string }>; }
+
+// eventType → the entities to snapshot from the payload's ids. Dual entries capture a documented
+// cross-entity mutation (e.g. retest.created also stamps finding.retestIds/status).
+const LEDGER_CAPTURES: Record<string, LedgerCapture[]> = {
+  'approval.requested': [{ idField: 'approvalId', ledgerName: 'approvalRequests', map: approvalRequests }],
+  'approval.approved': [{ idField: 'approvalId', ledgerName: 'approvalRequests', map: approvalRequests }],
+  'approval.rejected': [{ idField: 'approvalId', ledgerName: 'approvalRequests', map: approvalRequests }],
+  'evidence.created': [{ idField: 'evidenceId', ledgerName: 'evidenceLedger', map: evidenceLedger }],
+  'finding.created': [{ idField: 'findingId', ledgerName: 'findingsLedger', map: findingsLedger }],
+  'finding.updated': [{ idField: 'findingId', ledgerName: 'findingsLedger', map: findingsLedger }],
+  'retest.created': [
+    { idField: 'retestId', ledgerName: 'retestLedger', map: retestLedger },
+    { idField: 'findingId', ledgerName: 'findingsLedger', map: findingsLedger },
+  ],
+  'retest.updated': [
+    { idField: 'retestId', ledgerName: 'retestLedger', map: retestLedger },
+    { idField: 'findingId', ledgerName: 'findingsLedger', map: findingsLedger },
+  ],
+  'hypothesis.created': [{ idField: 'hypothesisId', ledgerName: 'hypothesisLedger', map: hypothesisLedger }],
+  'hypothesis.updated': [{ idField: 'hypothesisId', ledgerName: 'hypothesisLedger', map: hypothesisLedger }],
+  'hypothesis.promoted': [
+    { idField: 'hypothesisId', ledgerName: 'hypothesisLedger', map: hypothesisLedger },
+    { idField: 'findingId', ledgerName: 'findingsLedger', map: findingsLedger },
+  ],
+  'work_order.created': [{ idField: 'workOrderId', ledgerName: 'workOrderLedger', map: workOrderLedger }],
+  'work_order.updated': [{ idField: 'workOrderId', ledgerName: 'workOrderLedger', map: workOrderLedger }],
+  'work_order.completed': [
+    { idField: 'workOrderId', ledgerName: 'workOrderLedger', map: workOrderLedger },
+    { idField: 'hypothesisId', ledgerName: 'hypothesisLedger', map: hypothesisLedger },
+  ],
+  'draft.created': [{ idField: 'draftId', ledgerName: 'missionDrafts', map: missionDrafts }],
+  'draft.updated': [{ idField: 'draftId', ledgerName: 'missionDrafts', map: missionDrafts }],
+  'improvement.proposed': [{ idField: 'proposalId', ledgerName: 'improvementProposals', map: improvementProposals }],
+  'memory.proposed': [{ idField: 'proposalId', ledgerName: 'memoryProposals', map: memoryProposals }],
+  'memory.accepted': [
+    { idField: 'proposalId', ledgerName: 'memoryProposals', map: memoryProposals },
+    { idField: 'memoryEntryId', ledgerName: 'memoryCapsule', map: memoryCapsule },
+  ],
+  'memory.linked_existing': [
+    { idField: 'proposalId', ledgerName: 'memoryProposals', map: memoryProposals },
+    { idField: 'memoryEntryId', ledgerName: 'memoryCapsule', map: memoryCapsule },
+  ],
+  'memory.rejected': [{ idField: 'proposalId', ledgerName: 'memoryProposals', map: memoryProposals }],
+  'watch_loop.pulsed': [{ idField: 'watchCycleId', ledgerName: 'watchCycleLedger', map: watchCycleLedger }],
+};
+
+/** The ledgers the v1 ledger covers — the projection compared against state.json in replay checks. */
+export const LEDGER_COVERED = [
+  'approvalRequests', 'evidenceLedger', 'findingsLedger', 'retestLedger', 'hypothesisLedger',
+  'workOrderLedger', 'missionDrafts', 'improvementProposals', 'memoryProposals', 'memoryCapsule',
+  'watchCycleLedger',
+] as const;
+
+// Writable registry of the covered ledgers — used by resume to fold the log back into live state.
+// Cast through unknown: Map is invariant in its value type, but every entity carries `id: string`.
+const LEDGER_MAPS: Record<string, Map<string, { id: string }>> = {
+  approvalRequests: approvalRequests as unknown as Map<string, { id: string }>,
+  evidenceLedger: evidenceLedger as unknown as Map<string, { id: string }>,
+  findingsLedger: findingsLedger as unknown as Map<string, { id: string }>,
+  retestLedger: retestLedger as unknown as Map<string, { id: string }>,
+  hypothesisLedger: hypothesisLedger as unknown as Map<string, { id: string }>,
+  workOrderLedger: workOrderLedger as unknown as Map<string, { id: string }>,
+  missionDrafts: missionDrafts as unknown as Map<string, { id: string }>,
+  improvementProposals: improvementProposals as unknown as Map<string, { id: string }>,
+  memoryProposals: memoryProposals as unknown as Map<string, { id: string }>,
+  memoryCapsule: memoryCapsule as unknown as Map<string, { id: string }>,
+  watchCycleLedger: watchCycleLedger as unknown as Map<string, { id: string }>,
+};
+
+let missionLedger: MissionLedger | null = null;
+function ledgerFilePath(): string | null {
+  const root = stateRoot();
+  return root === 'memory' ? null : join(root, 'ledger.jsonl');
+}
+function getMissionLedger(): MissionLedger {
+  if (missionLedger) return missionLedger;
+  const file = ledgerFilePath();
+  if (file) {
+    mkdirSync(stateRoot(), { recursive: true });
+    // Continue seq past any recovered log so appended events stay monotonic across a resume.
+    const existing = readLedgerFile(file);
+    const startSeq = existing.length ? Math.max(...existing.map(e => e.seq)) + 1 : 0;
+    missionLedger = new MissionLedger(new JsonlFileSink(file), Date.now, startSeq);
+  } else {
+    missionLedger = new MissionLedger();
+  }
+  return missionLedger;
+}
+
+/**
+ * Resume-from-ledger — abrupt-crash recovery. state.json is debounced (≤1s) and only flushed on a
+ * GRACEFUL shutdown, so a SIGKILL / power-loss can lose the last window. ledger.jsonl is fsync'd per
+ * event, so it outlives that gap. On boot (AFTER loadPersistedState), fold the ledger and merge it
+ * over the restored snapshot: the ledger is authoritative for its covered ledgers because it is
+ * strictly more current. Entities only in the snapshot (or non-covered state) are left untouched.
+ */
+function resumeFromLedger(): void {
+  const file = ledgerFilePath();
+  if (!file) return;
+  let events;
+  try {
+    events = readLedgerFile(file);
+  } catch (error) {
+    console.warn(`[T3MP3ST] Ledger resume skipped (unreadable log): ${(error as Error).message || error}`);
+    return;
+  }
+  if (!events.length) return;
+  const folded = foldLedger(events);
+  let recovered = 0;
+  for (const [name, entities] of Object.entries(folded)) {
+    const map = LEDGER_MAPS[name];
+    if (!map) continue;
+    for (const [id, entity] of Object.entries(entities)) {
+      map.set(id, entity as { id: string });
+      recovered++;
+    }
+  }
+  console.log(`[T3MP3ST] Ledger resume: folded ${events.length} event(s) → ${recovered} entit(ies) across ${Object.keys(folded).length} ledger(s)`);
+}
+
+/** Record a complete, redacted upsert for each entity referenced by a contract event. */
+function recordLedgerFromContractEvent(type: string, payload: Record<string, unknown>): void {
+  const captures = LEDGER_CAPTURES[type];
+  if (!captures) return;
+  const ledger = getMissionLedger();
+  for (const cap of captures) {
+    const id = payload[cap.idField];
+    if (typeof id !== 'string' || !id) continue;
+    const entity = cap.map.get(id);
+    if (!entity) continue;
+    ledger.record({
+      type,
+      ledger: cap.ledgerName,
+      op: 'upsert',
+      id,
+      entity: redactSecrets(entity) as Record<string, unknown>,
+    });
+  }
+}
+
 function emitContractEvent(type: string, payload: Record<string, unknown>): void {
   broadcastEvent(type, {
     id: newId('evt'),
@@ -4575,6 +4734,12 @@ function emitContractEvent(type: string, payload: Record<string, unknown>): void
     console.warn(`[T3MP3ST] Event persistence failed: ${error.message || error}`);
   });
   schedulePersist(type);
+  // The ledger is auxiliary in v1 — a recording failure must NEVER break the mutation path.
+  try {
+    recordLedgerFromContractEvent(type, payload);
+  } catch (error) {
+    console.warn(`[T3MP3ST] Ledger record failed: ${(error as Error).message || error}`);
+  }
 }
 
 // =============================================================================
@@ -7396,6 +7561,7 @@ async function startServer() {
   console.log('');
 
   await loadPersistedState();
+  resumeFromLedger(); // reconcile any post-snapshot mutations from the fsync'd ledger (abrupt-crash recovery)
   llm = await initLLM();
 
   // Graceful-shutdown flush: on SIGTERM/SIGINT (Ctrl-C, docker stop, systemctl restart) write
